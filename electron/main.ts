@@ -95,6 +95,12 @@ function handlePiRecord(taskId: string, record: Record<string, unknown>): void {
       piText.set(taskId, (piText.get(taskId) || '') + update.delta)
       sendPi({ taskId, type: 'delta', text: update.delta })
     }
+  } else if (record.type === 'message_end') {
+    const message = record.message as { role?: string; errorMessage?: string } | undefined
+    if (message?.role === 'assistant' && message.errorMessage) {
+      const detail = message.errorMessage.length > 240 ? message.errorMessage.slice(0, 240) + '…' : message.errorMessage
+      sendPi({ taskId, type: 'error', text: `模型返回错误：${detail}` })
+    }
   } else if (record.type === 'tool_execution_start') {
     const name = String(record.toolName || 'tool')
     sendPi({ taskId, type: 'tool', text: name })

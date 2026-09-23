@@ -47,6 +47,7 @@ function App() {
   const [stream, setStream] = useState<Record<string, string>>({})
   const [working, setWorking] = useState<Record<string, boolean>>({})
   const [activity, setActivity] = useState<Record<string, string>>({})
+  const [errors, setErrors] = useState<Record<string, string>>({})
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [sidebarWidth, setSidebarWidth] = useState(() => {
     const saved = Number(localStorage.getItem('pidesk.sidebar-width'))
@@ -94,7 +95,8 @@ function App() {
       if (event.type === 'tool') setActivity(old => ({ ...old, [event.taskId]: event.text || '处理中' }))
       if (event.type === 'ready') setActivity(old => ({ ...old, [event.taskId]: '思考中' }))
       if (event.type === 'error') {
-        setActivity(old => ({ ...old, [event.taskId]: event.text || '出了点问题' }))
+        setErrors(old => ({ ...old, [event.taskId]: event.text || '出了点问题' }))
+        setActivity(old => ({ ...old, [event.taskId]: '' }))
         setWorking(old => ({ ...old, [event.taskId]: false }))
       }
       if (event.type === 'settled') {
@@ -181,10 +183,11 @@ function App() {
     if (!task) return
     setDraft('')
     setAttachments([])
+    setErrors(old => ({ ...old, [task.id]: '' }))
     setWorking(old => ({ ...old, [task!.id]: true }))
     setActivity(old => ({ ...old, [task!.id]: '正在启动 Pi' }))
     try { await window.desk.sendPrompt(task.id, content); await reload() }
-    catch (error) { setActivity(old => ({ ...old, [task!.id]: String(error) })); setWorking(old => ({ ...old, [task!.id]: false })) }
+    catch (error) { setErrors(old => ({ ...old, [task!.id]: String(error) })); setWorking(old => ({ ...old, [task!.id]: false })) }
   }
   async function deleteTask(task: Task) {
     modelCache.delete(task.id)
@@ -263,7 +266,7 @@ function App() {
                   <div className="message-body"><div className="message-meta"><strong>{message.role === 'user' ? '我' : 'Pi'}</strong><span>{shortTime(message.createdAt)}</span></div><div className="message-content">{message.role === 'assistant' ? <Markdown text={message.text}/> : message.text}</div></div>
                 </div>)}
                 {working[selectedTask.id] && <div className="message assistant"><div className="message-avatar">π</div><div className="message-body"><div className="message-meta"><strong>Pi</strong><span className="thinking-indicator"><span/> {activity[selectedTask.id] || '思考中'}</span></div>{stream[selectedTask.id] && <div className="message-content"><Markdown text={stream[selectedTask.id]}/></div>}</div></div>}
-                {!working[selectedTask.id] && activity[selectedTask.id] && <div className="inline-error">{activity[selectedTask.id]}</div>}
+                {!working[selectedTask.id] && errors[selectedTask.id] && <div className="inline-error">{errors[selectedTask.id]}</div>}
                 <div ref={chatEnd}/></div>
               </div>}
           </div>
