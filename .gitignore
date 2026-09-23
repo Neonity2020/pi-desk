@@ -1,0 +1,7 @@
+node_modules/
+out/
+dist/
+release/
+build/app-staging/
+.DS_Store
+*.log
