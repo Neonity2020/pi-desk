@@ -15,6 +15,7 @@ const piText = new Map<string, string>()
 const piPending = new Map<string, string[]>()
 const piRequests = new Map<string, (record: Record<string, unknown>) => void>()
 const piReady = new Map<string, Promise<void>>()
+const piModelCache = new Map<string, { models: PiModel[]; thinkingLevels: string[] }>()
 const terminalProcesses = new Map<string, pty.IPty>()
 const terminalBuffers = new Map<string, string>()
 
@@ -35,12 +36,12 @@ function saveData(data: AppData): void {
 }
 function findProject(id: string): Project {
   const project = readData().projects.find(item => item.id === id)
-  if (!project) throw new Error('Project not found')
+  if (!project) throw new Error('未找到项目')
   return project
 }
 function findTask(id: string): Task {
   const task = readData().tasks.find(item => item.id === id)
-  if (!task) throw new Error('Task not found')
+  if (!task) throw new Error('未找到任务')
   return task
 }
 function projectFile(project: Project, path: string): string {
@@ -48,13 +49,13 @@ function projectFile(project: Project, path: string): string {
   const rel = relative(project.path, full)
   const actual = realpathSync(full)
   const actualRel = relative(realpathSync(project.path), actual)
-  if (rel === '..' || rel.startsWith('../') || rel.startsWith('/') || actualRel === '..' || actualRel.startsWith('../') || actualRel.startsWith('/')) throw new Error('Path is outside this project')
+  if (rel === '..' || rel.startsWith('../') || rel.startsWith('/') || actualRel === '..' || actualRel.startsWith('../') || actualRel.startsWith('/')) throw new Error('路径超出项目范围')
   return full
 }
 function updateTask(id: string, change: (task: Task) => void): Task {
   const data = readData()
   const task = data.tasks.find(item => item.id === id)
-  if (!task) throw new Error('Task not found')
+  if (!task) throw new Error('未找到任务')
   change(task)
   task.updatedAt = Date.now()
   saveData(data)
@@ -81,7 +82,7 @@ function childEnv(): NodeJS.ProcessEnv {
 }
 function sendCommand(taskId: string, command: Record<string, unknown>): void {
   const child = piProcesses.get(taskId)
-  if (!child?.stdin?.writable) throw new Error('Pi is not running for this task')
+  if (!child?.stdin?.writable) throw new Error('该任务的 Pi 进程未在运行')
   child.stdin.write(JSON.stringify(command) + '\n')
 }
 function handlePiRecord(taskId: string, record: Record<string, unknown>): void {
@@ -103,7 +104,7 @@ function handlePiRecord(taskId: string, record: Record<string, unknown>): void {
     piText.delete(taskId)
     sendPi({ taskId, type: 'settled' })
   } else if (record.type === 'response' && record.command === 'prompt' && record.success === false) {
-    sendPi({ taskId, type: 'error', text: String(record.error || 'Pi rejected the prompt') })
+    sendPi({ taskId, type: 'error', text: String(record.error || 'Pi 拒绝了该请求') })
   }
 }
 function launchPi(task: Task): Promise<void> {
@@ -130,7 +131,7 @@ function launchPi(task: Task): Promise<void> {
       buffer = buffer.slice(split + 1)
       if (line) {
         try { handlePiRecord(task.id, JSON.parse(line)) }
-        catch { sendPi({ taskId: task.id, type: 'error', text: 'Pi sent an unreadable response.' }) }
+        catch { sendPi({ taskId: task.id, type: 'error', text: 'Pi 返回了无法解析的响应。' }) }
       }
       split = buffer.indexOf('\n')
     }
@@ -140,30 +141,40 @@ function launchPi(task: Task): Promise<void> {
     const message = chunk.toString('utf8').trim()
     if (message) sendPi({ taskId: task.id, type: 'tool', text: message.slice(0, 240) })
   })
-  child.on('error', error => sendPi({ taskId: task.id, type: 'error', text: `Could not start Pi: ${error.message}` }))
+  child.on('error', error => sendPi({ taskId: task.id, type: 'error', text: `无法启动 Pi：${error.message}` }))
   child.on('exit', code => {
     piProcesses.delete(task.id)
     piReady.delete(task.id)
     piBuffers.delete(task.id)
-    if (code && code !== 0) sendPi({ taskId: task.id, type: 'error', text: `Pi exited with code ${code}. Check that Pi is installed and signed in.` })
+    if (code && code !== 0) sendPi({ taskId: task.id, type: 'error', text: `Pi 已退出（退出码 ${code}）。请确认 Pi 已安装并已登录。` })
   })
   child.on('spawn', () => {
     sendPi({ taskId: task.id, type: 'ready' })
     const pending = piPending.get(task.id) || []
     piPending.delete(task.id)
     for (const message of pending) sendCommand(task.id, { id: crypto.randomUUID(), type: 'prompt', message, streamingBehavior: 'followUp' })
+    void warmPiModels(task.id)
   })
   return ready
+}
+async function warmPiModels(taskId: string): Promise<void> {
+  if (piModelCache.has(taskId)) return
+  try {
+    const models = ((await requestPi(taskId, { type: 'get_available_models' })).models || []) as PiModel[]
+    let thinkingLevels = ['off']
+    try { thinkingLevels = ((await requestPi(taskId, { type: 'get_available_thinking_levels' })).levels || ['off']) as string[] } catch { /* Levels stay default until a model is set. */ }
+    piModelCache.set(taskId, { models, thinkingLevels })
+  } catch { /* Cache stays cold; the next explicit request fetches. */ }
 }
 async function requestPi(taskId: string, command: Record<string, unknown>): Promise<Record<string, unknown>> {
   const task = findTask(taskId)
   await launchPi(task)
   const id = crypto.randomUUID()
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { piRequests.delete(id); reject(new Error('Pi did not respond in time')) }, 15000)
+    const timer = setTimeout(() => { piRequests.delete(id); reject(new Error('Pi 响应超时')) }, 15000)
     piRequests.set(id, record => {
       clearTimeout(timer)
-      if (record.success === false) reject(new Error(String(record.error || 'Pi command failed')))
+      if (record.success === false) reject(new Error(String(record.error || 'Pi 命令执行失败')))
       else resolve((record.data || {}) as Record<string, unknown>)
     })
     try { sendCommand(taskId, { id, ...command }) } catch (error) { clearTimeout(timer); piRequests.delete(id); reject(error) }
@@ -200,7 +211,7 @@ async function overview(project: Project): Promise<GitOverview> {
 }
 async function diff(project: Project, path: string): Promise<string> {
   const state = await overview(project)
-  if (!state.files.some(file => file.path === path)) throw new Error('File is not in the change list')
+  if (!state.files.some(file => file.path === path)) throw new Error('文件不在更改列表中')
   if (state.files.find(file => file.path === path)?.status === '??') {
     const full = projectFile(project, path)
     const content = readFileSync(full, 'utf8')
@@ -217,7 +228,7 @@ async function diff(project: Project, path: string): Promise<string> {
 function setupIPC(): void {
   ipcMain.handle('data:get', () => readData())
   ipcMain.handle('project:add', async () => {
-    const result = await dialog.showOpenDialog(mainWindow!, { properties: ['openDirectory'], title: 'Open a project folder' })
+    const result = await dialog.showOpenDialog(mainWindow!, { properties: ['openDirectory'], title: '选择项目文件夹' })
     if (result.canceled || !result.filePaths[0]) return null
     const path = result.filePaths[0]
     const data = readData()
@@ -234,7 +245,7 @@ function setupIPC(): void {
   ipcMain.handle('task:new', (_, projectId: string) => {
     findProject(projectId)
     const now = Date.now()
-    const task: Task = { id: crypto.randomUUID(), projectId, title: 'New task', createdAt: now, updatedAt: now, messages: [] }
+    const task: Task = { id: crypto.randomUUID(), projectId, title: '新任务', createdAt: now, updatedAt: now, messages: [] }
     const data = readData()
     data.tasks.unshift(task)
     data.selectedProjectId = projectId
@@ -257,13 +268,14 @@ function setupIPC(): void {
     data.tasks = data.tasks.filter(task => task.id !== id)
     if (data.selectedTaskId === id) data.selectedTaskId = data.tasks.find(task => task.projectId === data.selectedProjectId)?.id || null
     saveData(data)
+    piModelCache.delete(id)
     piProcesses.get(id)?.kill()
   })
   ipcMain.handle('pi:status', async () => {
     try {
       const { stdout } = await execFileAsync(executablePath(), ['--version'], { env: childEnv(), timeout: 5000 })
-      return { available: true, detail: stdout.trim() || 'Pi is ready' }
-    } catch (error) { return { available: false, detail: `Pi check failed: ${error instanceof Error ? error.message : String(error)}` } }
+      return { available: true, detail: stdout.trim() || 'Pi 已就绪' }
+    } catch (error) { return { available: false, detail: `Pi 检查失败：${error instanceof Error ? error.message : String(error)}` } }
   })
   ipcMain.handle('pi:prompt', (_, id: string, text: string) => {
     const task = findTask(id)
@@ -280,21 +292,28 @@ function setupIPC(): void {
   })
   ipcMain.handle('pi:stop', (_, id: string) => sendCommand(id, { id: crypto.randomUUID(), type: 'abort' }))
   ipcMain.handle('pi:models', async (_, id: string) => {
-    const [modelResult, state] = await Promise.all([requestPi(id, { type: 'get_available_models' }), requestPi(id, { type: 'get_state' })])
-    const models = (modelResult.models || []) as PiModel[]
+    const state = await requestPi(id, { type: 'get_state' })
     const current = (state.model || null) as PiModel | null
-    let thinkingLevels = ['off']
-    if (current) {
-      const result = await requestPi(id, { type: 'get_available_thinking_levels' })
-      thinkingLevels = (result.levels || ['off']) as string[]
+    let cached = piModelCache.get(id)
+    if (!cached) {
+      const models = ((await requestPi(id, { type: 'get_available_models' })).models || []) as PiModel[]
+      let thinkingLevels = ['off']
+      if (current) {
+        try { thinkingLevels = ((await requestPi(id, { type: 'get_available_thinking_levels' })).levels || ['off']) as string[] } catch { /* keep default */ }
+      }
+      cached = { models, thinkingLevels }
+      piModelCache.set(id, cached)
     }
-    return { models, current, thinkingLevel: String(state.thinkingLevel || 'off'), thinkingLevels }
+    return { models: cached.models, current, thinkingLevel: String(state.thinkingLevel || 'off'), thinkingLevels: cached.thinkingLevels }
   })
   ipcMain.handle('pi:model:set', async (_, id: string, provider: string, modelId: string) => {
     const result = await requestPi(id, { type: 'set_model', provider, modelId })
     const model = (result.model || result) as PiModel
     const [state, levels] = await Promise.all([requestPi(id, { type: 'get_state' }), requestPi(id, { type: 'get_available_thinking_levels' })])
-    return { model, thinkingLevel: String(state.thinkingLevel || 'off'), thinkingLevels: (levels.levels || ['off']) as string[] }
+    const thinkingLevels = (levels.levels || ['off']) as string[]
+    const cached = piModelCache.get(id)
+    if (cached) cached.thinkingLevels = thinkingLevels
+    return { model, thinkingLevel: String(state.thinkingLevel || 'off'), thinkingLevels }
   })
   ipcMain.handle('pi:thinking:set', async (_, id: string, level: string) => { await requestPi(id, { type: 'set_thinking_level', level }) })
   ipcMain.handle('git:overview', (_, id: string) => overview(findProject(id)))
@@ -310,9 +329,9 @@ function setupIPC(): void {
   ipcMain.handle('files:read', (_, id: string, path: string) => {
     const project = findProject(id)
     const full = projectFile(project, path)
-    if (statSync(full).size > 1024 * 1024) return 'File is too large to preview (limit: 1 MB).'
+    if (statSync(full).size > 1024 * 1024) return '文件过大，无法预览（上限 1 MB）。'
     const content = readFileSync(full)
-    if (content.includes(0)) return 'Binary file preview is not available.'
+    if (content.includes(0)) return '二进制文件不支持预览。'
     return content.toString('utf8')
   })
   ipcMain.handle('terminal:start', (_, id: string) => {
@@ -335,7 +354,7 @@ function setupIPC(): void {
   ipcMain.handle('project:reveal', (_, id: string) => shell.showItemInFolder(findProject(id).path))
   ipcMain.handle('file:choose', async (_, id: string) => {
     const project = findProject(id)
-    const result = await dialog.showOpenDialog(mainWindow!, { properties: ['openFile', 'multiSelections'], defaultPath: project.path, title: 'Attach files' })
+    const result = await dialog.showOpenDialog(mainWindow!, { properties: ['openFile', 'multiSelections'], defaultPath: project.path, title: '选择要附加的文件' })
     if (result.canceled) return null
     return result.filePaths[0] || null
   })
