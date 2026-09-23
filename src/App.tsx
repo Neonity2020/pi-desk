@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { ReactNode } from 'react'
+import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react'
 import {
   ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Check, ChevronDown, ChevronRight,
   CircleHelp, Code2, Command, FileCode2, FileDiff, Folder, FolderOpen,
@@ -42,6 +42,11 @@ function App() {
   const [working, setWorking] = useState<Record<string, boolean>>({})
   const [activity, setActivity] = useState<Record<string, string>>({})
   const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [sidebarWidth, setSidebarWidth] = useState(() => {
+    const saved = Number(localStorage.getItem('pidesk.sidebar-width'))
+    return saved >= 220 && saved <= 480 ? Math.round(saved) : 267
+  })
+  const [resizing, setResizing] = useState(false)
   const [inspectorOpen, setInspectorOpen] = useState(true)
   const [terminalOpen, setTerminalOpen] = useState(false)
   const [inspectorTab, setInspectorTab] = useState<'changes' | 'files'>('changes')
@@ -50,6 +55,8 @@ function App() {
   const [showProjectMenu, setShowProjectMenu] = useState(false)
   const chatEnd = useRef<HTMLDivElement>(null)
   const modelMenuRef = useRef<HTMLDivElement>(null)
+  const resizeActive = useRef(false)
+  const resizeOrigin = useRef(0)
   const selectedTask = useMemo(() => data.tasks.find(task => task.id === data.selectedTaskId) || null, [data])
   const selectedProject = useMemo(() => data.projects.find(project => project.id === data.selectedProjectId) || null, [data])
 
@@ -111,6 +118,27 @@ function App() {
     return () => document.removeEventListener('pointerdown', closeOutside)
   }, [modelMenu])
 
+  useEffect(() => { localStorage.setItem('pidesk.sidebar-width', String(sidebarWidth)) }, [sidebarWidth])
+
+  function clampSidebarWidth(width: number) { return Math.min(480, Math.max(220, Math.round(width))) }
+  function onResizeStart(event: ReactPointerEvent<HTMLDivElement>) {
+    event.preventDefault()
+    resizeOrigin.current = event.clientX - sidebarWidth
+    resizeActive.current = true
+    event.currentTarget.setPointerCapture(event.pointerId)
+    setResizing(true)
+  }
+  function onResizeMove(event: ReactPointerEvent<HTMLDivElement>) {
+    if (!resizeActive.current) return
+    setSidebarWidth(clampSidebarWidth(event.clientX - resizeOrigin.current))
+  }
+  function onResizeEnd(event: ReactPointerEvent<HTMLDivElement>) {
+    if (!resizeActive.current) return
+    resizeActive.current = false
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
+    setResizing(false)
+  }
+
   async function addProject() { const project = await window.desk.addProject(); if (project) { await reload(); await refreshGit(project.id) } }
   async function newTask(projectId?: string) {
     const id = projectId || selectedProject?.id
@@ -163,8 +191,8 @@ function App() {
   }
 
   const filteredTasks = data.tasks.filter(task => task.title.toLowerCase().includes(search.toLowerCase()) || data.projects.find(p => p.id === task.projectId)?.name.toLowerCase().includes(search.toLowerCase()))
-  return <div className="app-shell">
-    {sidebarOpen && <aside className="sidebar">
+  return <div className={`app-shell${resizing ? ' resizing' : ''}`}>
+    {sidebarOpen && <aside className="sidebar" style={{ width: sidebarWidth }}>
       <div className="sidebar-top drag-region"><div className="brand"><span className="brand-mark">π</span><span>Pi Desk</span></div><button className="icon-button no-drag" title="Hide sidebar (⌘B)" onClick={() => setSidebarOpen(false)}><PanelRight size={16}/></button></div>
       <button className="new-task-button" onClick={() => newTask()}><Plus size={17}/><span>New task</span><span className="shortcut">⌘ N</span></button>
       <button className="sidebar-action" onClick={() => setSearchOpen(true)}><Search size={16}/><span>Search tasks</span><span className="shortcut">⌘ K</span></button>
@@ -189,6 +217,7 @@ function App() {
         <div className="status-copy" title={pi.detail}><strong>{pi.available ? 'Pi connected' : 'Pi unavailable'}</strong><span>{pi.detail}</span></div>
         <button className="icon-button" title="Refresh Pi status" onClick={() => window.desk.piStatus().then(setPi)}><RefreshCw size={14}/></button>
       </div>
+      <div className="sidebar-resizer" title="Drag to resize · double-click to reset" onPointerDown={onResizeStart} onPointerMove={onResizeMove} onPointerUp={onResizeEnd} onLostPointerCapture={onResizeEnd} onDoubleClick={() => setSidebarWidth(267)}/>
     </aside>}
 
     <main className="main-area">
