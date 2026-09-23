@@ -4,12 +4,13 @@ import {
   ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Check, ChevronDown, ChevronRight,
   CircleHelp, Code2, Command, FileCode2, FileDiff, Folder, FolderOpen,
   GitBranch, GitPullRequest, PanelRight, MessageCircle, MoreHorizontal,
-  PanelBottom, Plus, RefreshCw, Search, Send, Settings2, Sparkles, Square,
+  Mic, PanelBottom, Paperclip, Plus, RefreshCw, Search, Send, Settings2, Shield,
+  Sparkles, Square,
   Terminal as TerminalIcon, Trash2, X
 } from 'lucide-react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
-import type { AppData, FileEntry, GitFile, GitOverview, PiEvent, PiStatus, Project, Task } from './types'
+import type { AppData, FileEntry, GitFile, GitOverview, PiEvent, PiModel, PiStatus, Project, Task } from './types'
 
 const emptyData: AppData = { projects: [], tasks: [], selectedProjectId: null, selectedTaskId: null }
 const emptyGit: GitOverview = { branch: '', files: [], isRepository: false }
@@ -27,6 +28,16 @@ function App() {
   const [selectedFile, setSelectedFile] = useState<string | null>(null)
   const [diff, setDiff] = useState('')
   const [draft, setDraft] = useState('')
+  const [modelMenu, setModelMenu] = useState(false)
+  const [permissionMenu, setPermissionMenu] = useState(false)
+  const [models, setModels] = useState<PiModel[]>([])
+  const [currentModel, setCurrentModel] = useState<PiModel | null>(null)
+  const [thinkingLevels, setThinkingLevels] = useState<string[]>(['off'])
+  const [thinkingLevel, setThinkingLevel] = useState('off')
+  const [modelError, setModelError] = useState('')
+  const [modelSearch, setModelSearch] = useState('')
+  const [permission, setPermission] = useState('默认权限')
+  const [attachments, setAttachments] = useState<string[]>([])
   const [stream, setStream] = useState<Record<string, string>>({})
   const [working, setWorking] = useState<Record<string, boolean>>({})
   const [activity, setActivity] = useState<Record<string, string>>({})
@@ -38,6 +49,7 @@ function App() {
   const [search, setSearch] = useState('')
   const [showProjectMenu, setShowProjectMenu] = useState(false)
   const chatEnd = useRef<HTMLDivElement>(null)
+  const modelMenuRef = useRef<HTMLDivElement>(null)
   const selectedTask = useMemo(() => data.tasks.find(task => task.id === data.selectedTaskId) || null, [data])
   const selectedProject = useMemo(() => data.projects.find(project => project.id === data.selectedProjectId) || null, [data])
 
@@ -90,6 +102,14 @@ function App() {
     const timer = window.setInterval(() => refreshGit(selectedProject.id), 8000)
     return () => window.clearInterval(timer)
   }, [selectedProject?.id, refreshGit])
+  useEffect(() => {
+    if (!modelMenu) return
+    const closeOutside = (event: PointerEvent) => {
+      if (event.target instanceof Node && !modelMenuRef.current?.contains(event.target)) setModelMenu(false)
+    }
+    document.addEventListener('pointerdown', closeOutside)
+    return () => document.removeEventListener('pointerdown', closeOutside)
+  }, [modelMenu])
 
   async function addProject() { const project = await window.desk.addProject(); if (project) { await reload(); await refreshGit(project.id) } }
   async function newTask(projectId?: string) {
@@ -117,6 +137,7 @@ function App() {
     }
     if (!task) return
     setDraft('')
+    setAttachments([])
     setWorking(old => ({ ...old, [task!.id]: true }))
     setActivity(old => ({ ...old, [task!.id]: 'Starting Pi' }))
     try { await window.desk.sendPrompt(task.id, content); await reload() }
@@ -125,6 +146,20 @@ function App() {
   async function deleteTask(task: Task) {
     await window.desk.deleteTask(task.id)
     await reload()
+  }
+  async function toggleModelMenu() {
+    const opening = !modelMenu
+    setModelMenu(opening)
+    setModelError('')
+    if (opening) setModelSearch('')
+    if (!opening || !selectedTask) return
+    try {
+      const state = await window.desk.getPiModels(selectedTask.id)
+      setModels(state.models)
+      setCurrentModel(state.current)
+      setThinkingLevels(state.thinkingLevels)
+      setThinkingLevel(state.thinkingLevel)
+    } catch (error) { setModelError(String(error)) }
   }
 
   const filteredTasks = data.tasks.filter(task => task.title.toLowerCase().includes(search.toLowerCase()) || data.projects.find(p => p.id === task.projectId)?.name.toLowerCase().includes(search.toLowerCase()))
@@ -184,11 +219,20 @@ function App() {
               </div>}
           </div>
           {selectedProject && <div className="composer-area"><div className="composer">
-            <textarea value={draft} onChange={event => setDraft(event.target.value)} placeholder="Ask Pi to build, fix, or explore…" rows={3} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); send() } }}/>
-            <div className="composer-bottom"><div className="composer-context"><span className="model-icon">π</span><span>Pi</span><ChevronDown size={12}/><span className="composer-divider"/><Folder size={13}/><span className="ellipsis">{selectedProject.name}</span></div>
-              {selectedTask && working[selectedTask.id] ? <button className="send-button stop" title="Stop Pi" onClick={() => window.desk.stopPrompt(selectedTask.id)}><Square size={13} fill="currentColor"/></button> : <button className="send-button" title="Send message" disabled={!draft.trim()} onClick={() => send()}><ArrowUp size={17}/></button>}
+            {attachments.length > 0 && <div className="composer-attachments">{attachments.map((file, index) => <span key={`${file}-${index}`}><FileCode2 size={13}/>{file}<button aria-label="Remove attachment" onClick={() => setAttachments(items => items.filter((_, i) => i !== index))}><X size={12}/></button></span>)}</div>}
+            <textarea value={draft} onChange={event => setDraft(event.target.value)} placeholder="Ask anything, @mention files, or / for skills" rows={2} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); send() } }}/>
+            <div className="composer-bottom">
+              <div className="composer-tools">
+                <button className="composer-icon" title="Attach files" onClick={() => window.desk.openFile(selectedProject.id).then(path => { if (path) setAttachments(items => [...items, path.split(/[\\/]/).pop() || path]) })}><Plus size={22}/></button>
+                <div className="composer-menu-wrap"><button className="permission-control" onClick={() => setPermissionMenu(value => !value)}><Shield size={16}/><span>{permission}</span><ChevronDown size={13}/></button>{permissionMenu && <div className="composer-popover"><button onClick={() => { setPermission('默认权限'); setPermissionMenu(false) }}>默认权限</button><button onClick={() => { setPermission('每次确认'); setPermissionMenu(false) }}>每次确认</button></div>}</div>
+              </div>
+              <div className="composer-tools composer-tools-right">
+                <div className="composer-menu-wrap" ref={modelMenuRef}><button className="model-control" onClick={toggleModelMenu}><span>{currentModel?.name || 'Pi 模型'}</span><span className="reasoning-label">{thinkingLevel === 'off' ? '关闭' : thinkingLevel} 推理</span><ChevronDown size={13}/></button>{modelMenu && <div className="composer-popover model-popover"><div className="popover-label">Pi 模型 · provider</div><label className="model-search"><Search size={14}/><input autoFocus value={modelSearch} onChange={event => setModelSearch(event.target.value)} placeholder="搜索模型或 provider"/><kbd>⌘F</kbd></label>{modelError && <div className="model-error">{modelError}</div>}{models.length === 0 && !modelError && <div className="model-loading">正在读取 Pi 模型…</div>}{(() => { const query = modelSearch.trim().toLowerCase(); const filtered = models.filter(item => `${item.name} ${item.provider} ${item.id}`.toLowerCase().includes(query)); return filtered.length ? filtered.map(item => <button key={`${item.provider}/${item.id}`} className={currentModel?.provider === item.provider && currentModel.id === item.id ? 'selected' : ''} onClick={async () => { if (!selectedTask) return; try { const result = await window.desk.setPiModel(selectedTask.id, item.provider, item.id); setCurrentModel(result.model); setThinkingLevels(result.thinkingLevels); setThinkingLevel(result.thinkingLevel); setModelMenu(false) } catch (error) { setModelError(String(error)) } }}><span className="model-option"><strong>{item.name}</strong><small>{item.provider} · {item.id}</small></span>{currentModel?.provider === item.provider && currentModel.id === item.id && <Check size={13}/>}</button>) : models.length > 0 && <div className="model-loading">没有匹配的模型</div> })()}{thinkingLevels.length > 0 && <><div className="popover-label">推理强度</div>{thinkingLevels.map(level => <button key={level} className={thinkingLevel === level ? 'selected' : ''} onClick={async () => { if (!selectedTask) return; try { await window.desk.setPiThinkingLevel(selectedTask.id, level); setThinkingLevel(level) } catch (error) { setModelError(String(error)) } }}>{level === 'off' ? '关闭' : level}{thinkingLevel === level && <Check size={13}/>}</button>)}</>}</div>}</div>
+                <button className="composer-icon mic-control" title="Voice input (coming soon)" disabled><Mic size={19}/></button>
+                {selectedTask && working[selectedTask.id] ? <button className="send-button stop" title="Stop Pi" onClick={() => window.desk.stopPrompt(selectedTask.id)}><Square size={13} fill="currentColor"/></button> : <button className="send-button" title="Send message" disabled={!draft.trim()} onClick={() => send()}><ArrowUp size={20}/></button>}
+              </div>
             </div>
-          </div><div className="composer-note">Pi can read and edit files in this project. Review changes before committing.</div></div>}
+          </div></div>}
           {terminalOpen && selectedProject && <TerminalPanel project={selectedProject} onClose={() => setTerminalOpen(false)}/>}
         </section>
 
@@ -290,6 +334,19 @@ function inlineMarkdown(text: string): ReactNode[] {
   })
 }
 
+function splitTableRow(line: string): string[] {
+  let trimmed = line.trim().replace(/\\\|/g, '\u0000')
+  if (trimmed.startsWith('|')) trimmed = trimmed.slice(1)
+  if (trimmed.endsWith('|')) trimmed = trimmed.slice(0, -1)
+  return trimmed.split('|').map(cell => cell.trim().replace(/\u0000/g, '|'))
+}
+
+function tableAlignment(delimiter: string): ('left' | 'center' | 'right')[] | null {
+  const cells = splitTableRow(delimiter)
+  if (!cells.length || !cells.every(cell => /^:?-+:?$/.test(cell))) return null
+  return cells.map(cell => (cell.startsWith(':') && cell.endsWith(':')) ? 'center' : cell.endsWith(':') ? 'right' : 'left')
+}
+
 function Markdown({ text }: { text: string }) {
   const lines = text.split('\n')
   const blocks: ReactNode[] = []
@@ -312,6 +369,20 @@ function Markdown({ text }: { text: string }) {
       flushParagraph(); flushList()
       const level = Math.min(heading[1].length, 4)
       blocks.push(<div className={`md-heading md-h${level}`} key={blocks.length}>{inlineMarkdown(heading[2])}</div>)
+    } else if (line.includes('|') && i + 1 < lines.length) {
+      const align = tableAlignment(lines[i + 1])
+      const header = align ? splitTableRow(line) : null
+      if (align && header && align.length === header.length) {
+        flushParagraph(); flushList()
+        i += 2
+        const rows: string[][] = []
+        while (i < lines.length && lines[i].trim() && lines[i].includes('|')) { rows.push(splitTableRow(lines[i])); i++ }
+        i--
+        blocks.push(<div className="md-table-wrap" key={blocks.length}><table className="md-table">
+          <thead><tr>{header.map((cell, c) => <th key={c} style={{ textAlign: align[c] }}>{inlineMarkdown(cell)}</th>)}</tr></thead>
+          <tbody>{rows.map((row, r) => <tr key={r}>{row.map((cell, c) => <td key={c} style={{ textAlign: align[c] }}>{inlineMarkdown(cell)}</td>)}</tr>)}</tbody>
+        </table></div>)
+      } else { flushList(); paragraph.push(line) }
     } else if (bullet) {
       flushParagraph()
       const ordered = /\d/.test(bullet[1][0])

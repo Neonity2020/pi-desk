@@ -28,7 +28,11 @@ const api: DeskAPI = {
     ipcRenderer.on('terminal:data', listener)
     return () => ipcRenderer.removeListener('terminal:data', listener)
   },
-  revealProject: (projectId: string) => ipcRenderer.invoke('project:reveal', projectId)
+  revealProject: (projectId: string) => ipcRenderer.invoke('project:reveal', projectId),
+  openFile: (projectId: string) => ipcRenderer.invoke('file:choose', projectId),
+  getPiModels: (taskId: string) => ipcRenderer.invoke('pi:models', taskId),
+  setPiModel: (taskId: string, provider: string, modelId: string) => ipcRenderer.invoke('pi:model:set', taskId, provider, modelId),
+  setPiThinkingLevel: (taskId: string, level: string) => ipcRenderer.invoke('pi:thinking:set', taskId, level)
 }
 
 contextBridge.exposeInMainWorld('desk', api)

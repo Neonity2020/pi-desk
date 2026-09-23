@@ -5,7 +5,7 @@ import { basename, join, relative, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { promisify } from 'node:util'
 import * as pty from 'node-pty'
-import type { AppData, GitFile, GitOverview, Message, PiEvent, Project, Task } from '../src/types'
+import type { AppData, GitFile, GitOverview, Message, PiEvent, PiModel, Project, Task } from '../src/types'
 
 const execFileAsync = promisify(execFile)
 let mainWindow: BrowserWindow | null = null
@@ -13,6 +13,8 @@ const piProcesses = new Map<string, ReturnType<typeof spawn>>()
 const piBuffers = new Map<string, string>()
 const piText = new Map<string, string>()
 const piPending = new Map<string, string[]>()
+const piRequests = new Map<string, (record: Record<string, unknown>) => void>()
+const piReady = new Map<string, Promise<void>>()
 const terminalProcesses = new Map<string, pty.IPty>()
 const terminalBuffers = new Map<string, string>()
 
@@ -83,7 +85,10 @@ function sendCommand(taskId: string, command: Record<string, unknown>): void {
   child.stdin.write(JSON.stringify(command) + '\n')
 }
 function handlePiRecord(taskId: string, record: Record<string, unknown>): void {
-  if (record.type === 'message_update') {
+  if (record.type === 'response' && typeof record.id === 'string') {
+    const resolveRequest = piRequests.get(record.id)
+    if (resolveRequest) { piRequests.delete(record.id); resolveRequest(record) }
+  } else if (record.type === 'message_update') {
     const update = record.assistantMessageEvent as { type?: string; delta?: string } | undefined
     if (update?.type === 'text_delta' && update.delta) {
       piText.set(taskId, (piText.get(taskId) || '') + update.delta)
@@ -101,8 +106,8 @@ function handlePiRecord(taskId: string, record: Record<string, unknown>): void {
     sendPi({ taskId, type: 'error', text: String(record.error || 'Pi rejected the prompt') })
   }
 }
-function launchPi(task: Task): void {
-  if (piProcesses.has(task.id)) return
+function launchPi(task: Task): Promise<void> {
+  if (piProcesses.has(task.id)) return piReady.get(task.id) || Promise.resolve()
   const project = findProject(task.projectId)
   const sessionDir = join(app.getPath('userData'), 'pi-sessions')
   mkdirSync(sessionDir, { recursive: true })
@@ -110,6 +115,12 @@ function launchPi(task: Task): void {
     cwd: project.path, env: childEnv(), stdio: ['pipe', 'pipe', 'pipe']
   })
   piProcesses.set(task.id, child)
+  const ready = new Promise<void>((resolve, reject) => {
+    child.once('spawn', () => resolve())
+    child.once('error', reject)
+  })
+  void ready.catch(() => undefined)
+  piReady.set(task.id, ready)
   piBuffers.set(task.id, '')
   child.stdout?.on('data', (chunk: Buffer) => {
     let buffer = (piBuffers.get(task.id) || '') + chunk.toString('utf8')
@@ -132,6 +143,7 @@ function launchPi(task: Task): void {
   child.on('error', error => sendPi({ taskId: task.id, type: 'error', text: `Could not start Pi: ${error.message}` }))
   child.on('exit', code => {
     piProcesses.delete(task.id)
+    piReady.delete(task.id)
     piBuffers.delete(task.id)
     if (code && code !== 0) sendPi({ taskId: task.id, type: 'error', text: `Pi exited with code ${code}. Check that Pi is installed and signed in.` })
   })
@@ -140,6 +152,21 @@ function launchPi(task: Task): void {
     const pending = piPending.get(task.id) || []
     piPending.delete(task.id)
     for (const message of pending) sendCommand(task.id, { id: crypto.randomUUID(), type: 'prompt', message, streamingBehavior: 'followUp' })
+  })
+  return ready
+}
+async function requestPi(taskId: string, command: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const task = findTask(taskId)
+  await launchPi(task)
+  const id = crypto.randomUUID()
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { piRequests.delete(id); reject(new Error('Pi did not respond in time')) }, 15000)
+    piRequests.set(id, record => {
+      clearTimeout(timer)
+      if (record.success === false) reject(new Error(String(record.error || 'Pi command failed')))
+      else resolve((record.data || {}) as Record<string, unknown>)
+    })
+    try { sendCommand(taskId, { id, ...command }) } catch (error) { clearTimeout(timer); piRequests.delete(id); reject(error) }
   })
 }
 async function git(project: Project, args: string[]): Promise<string> {
@@ -252,6 +279,24 @@ function setupIPC(): void {
     } else sendCommand(id, { id: crypto.randomUUID(), type: 'prompt', message, streamingBehavior: 'followUp' })
   })
   ipcMain.handle('pi:stop', (_, id: string) => sendCommand(id, { id: crypto.randomUUID(), type: 'abort' }))
+  ipcMain.handle('pi:models', async (_, id: string) => {
+    const [modelResult, state] = await Promise.all([requestPi(id, { type: 'get_available_models' }), requestPi(id, { type: 'get_state' })])
+    const models = (modelResult.models || []) as PiModel[]
+    const current = (state.model || null) as PiModel | null
+    let thinkingLevels = ['off']
+    if (current) {
+      const result = await requestPi(id, { type: 'get_available_thinking_levels' })
+      thinkingLevels = (result.levels || ['off']) as string[]
+    }
+    return { models, current, thinkingLevel: String(state.thinkingLevel || 'off'), thinkingLevels }
+  })
+  ipcMain.handle('pi:model:set', async (_, id: string, provider: string, modelId: string) => {
+    const result = await requestPi(id, { type: 'set_model', provider, modelId })
+    const model = (result.model || result) as PiModel
+    const [state, levels] = await Promise.all([requestPi(id, { type: 'get_state' }), requestPi(id, { type: 'get_available_thinking_levels' })])
+    return { model, thinkingLevel: String(state.thinkingLevel || 'off'), thinkingLevels: (levels.levels || ['off']) as string[] }
+  })
+  ipcMain.handle('pi:thinking:set', async (_, id: string, level: string) => { await requestPi(id, { type: 'set_thinking_level', level }) })
   ipcMain.handle('git:overview', (_, id: string) => overview(findProject(id)))
   ipcMain.handle('git:diff', (_, id: string, path: string) => diff(findProject(id), path))
   ipcMain.handle('files:list', (_, id: string, path: string) => {
@@ -288,6 +333,12 @@ function setupIPC(): void {
   ipcMain.handle('terminal:write', (_, id: string, text: string) => terminalProcesses.get(id)?.write(text))
   ipcMain.handle('terminal:resize', (_, id: string, cols: number, rows: number) => terminalProcesses.get(id)?.resize(Math.max(2, cols), Math.max(2, rows)))
   ipcMain.handle('project:reveal', (_, id: string) => shell.showItemInFolder(findProject(id).path))
+  ipcMain.handle('file:choose', async (_, id: string) => {
+    const project = findProject(id)
+    const result = await dialog.showOpenDialog(mainWindow!, { properties: ['openFile', 'multiSelections'], defaultPath: project.path, title: 'Attach files' })
+    if (result.canceled) return null
+    return result.filePaths[0] || null
+  })
 }
 
 app.whenReady().then(() => {

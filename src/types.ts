@@ -6,6 +6,7 @@ export type GitFile = { path: string; status: string; additions: number; deletio
 export type GitOverview = { branch: string; files: GitFile[]; isRepository: boolean }
 export type FileEntry = { path: string; name: string; isDirectory: boolean }
 export type PiStatus = { available: boolean; detail: string }
+export type PiModel = { id: string; name: string; provider: string; reasoning?: boolean }
 export type PiEvent = { taskId: string; type: 'delta' | 'settled' | 'error' | 'tool' | 'ready'; text?: string }
 
 export interface DeskAPI {
@@ -28,4 +29,8 @@ export interface DeskAPI {
   terminalResize(projectId: string, cols: number, rows: number): Promise<void>
   onTerminalData(handler: (event: { projectId: string; data: string }) => void): () => void
   revealProject(projectId: string): Promise<void>
+  openFile(projectId: string): Promise<string | null>
+  getPiModels(taskId: string): Promise<{ models: PiModel[]; current: PiModel | null; thinkingLevel: string; thinkingLevels: string[] }>
+  setPiModel(taskId: string, provider: string, modelId: string): Promise<{ model: PiModel; thinkingLevel: string; thinkingLevels: string[] }>
+  setPiThinkingLevel(taskId: string, level: string): Promise<void>
 }
